@@ -91,6 +91,7 @@ def log_validation(
         revision=args.revision,
         torch_dtype=weight_dtype,
         **pipeline_args,
+        safety_checker=None,
     )
 
     # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
@@ -816,6 +817,7 @@ def main(args):
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
+                safety_checker=None,
             )
             pipeline.set_progress_bar_config(disable=True)
 

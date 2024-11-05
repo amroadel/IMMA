@@ -109,6 +109,7 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
         safety_checker=None,
         revision=args.revision,
         torch_dtype=weight_dtype,
+        safety_checker=None,
     )
     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
@@ -923,6 +924,7 @@ def main():
                 vae=vae,
                 unet=unet,
                 tokenizer=tokenizer,
+                safety_checker=None,
             )
             pipeline.save_pretrained(args.output_dir)
         # Save the newly trained embeddings
