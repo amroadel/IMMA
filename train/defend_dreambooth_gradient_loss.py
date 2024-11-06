@@ -1267,7 +1267,10 @@ def main(args):
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                
+                gradient_loss = (torch.autograd.grad(loss, model_pred, create_graph=True)[0])
+                total_loss = (gradient_loss ** 2).mean() - loss
+                loss = total_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = (
