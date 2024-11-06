@@ -58,7 +58,7 @@ dependencies:
   - zeromq=4.3.4=h9c3ff4c_1
   - zlib=1.2.13=h5eee18b_0
   - pip:
-      - clip-by-openai
+
       - absl-py==1.4.0
       - accelerate==0.20.3
       - aiohttp==3.8.4

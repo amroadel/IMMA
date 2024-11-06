@@ -1268,7 +1268,16 @@ def main(args):
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                gradient_loss = (torch.autograd.grad(loss, params_to_optimize, create_graph=True)[0])
+                # Define trainable parameters based on the condition
+                if args.train_text_encoder:
+                    trainable_params = list(unet.parameters()) + list(text_encoder.parameters())
+                else:
+                    trainable_params = list(unet.parameters())
+
+                # trainable_params = [p for p in unet.parameters() if p.requires_grad]
+                # gradient_loss = (torch.autograd.grad(loss, params_to_optimize, create_graph=True)[0])
+                # gradient_loss = (torch.autograd.grad(loss, trainable_params, create_graph=True)[0])
+                gradient_loss = (torch.autograd.grad(loss, model_pred.float(), create_graph=True)[0])
                 total_loss = (gradient_loss.mean()**2) - loss
                 loss = total_loss
                 accelerator.backward(loss)
