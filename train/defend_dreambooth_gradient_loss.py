@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2023 The HuggingFace Inc. team. All rights reserved.
 #
@@ -11,7 +12,6 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
 
 import argparse
 import gc
@@ -25,7 +25,6 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -39,7 +38,6 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
-import torchvision
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -77,12 +75,6 @@ def log_validation(
     )
 
     pipeline_args = {}
-    image_save_transform = transforms.Compose([transforms.ToTensor()])
-
-    if args.validation_prompt_file is not None:
-        validation_prompts_df = pd.read_csv(args.validation_prompt_file, index_col=0)
-        validation_prompts = [str(row.prompt).format(args.special_token) for _, row in validation_prompts_df.iterrows()]
-
 
     if vae is not None:
         pipeline_args["vae"] = vae
@@ -99,6 +91,7 @@ def log_validation(
         revision=args.revision,
         torch_dtype=weight_dtype,
         **pipeline_args,
+        safety_checker=None,
     )
 
     # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
@@ -128,26 +121,14 @@ def log_validation(
     generator = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
     images = []
     if args.validation_images is None:
-        if args.validation_prompt_file is not None:
-            for prompt_idx, validation_prompt in enumerate(validation_prompts):
-                pipeline_args = {"prompt": validation_prompt}
-                for idx in range(args.num_validation_images):
-                    with torch.autocast("cuda"):
-                        image = pipeline(**pipeline_args, num_inference_steps=25, generator=generator).images[0]
-                    torchvision.utils.save_image(image_save_transform(image), f"{args.output_dir}/{epoch}_{prompt_idx}_{idx}.png")
-                    images.append(image)
-        else:
-            for idx in range(args.num_validation_images):
-                with torch.autocast("cuda"):
-                    image = pipeline(**pipeline_args, num_inference_steps=25, generator=generator).images[0]
-                image_save_name = f"{epoch}_{idx}.png".zfill(11)
-                torchvision.utils.save_image(image_save_transform(image), f"{args.output_dir}/{image_save_name}")
-                images.append(image)
+        for _ in range(args.num_validation_images):
+            with torch.autocast("cuda"):
+                image = pipeline(**pipeline_args, num_inference_steps=25, generator=generator).images[0]
+            images.append(image)
     else:
-        for idx, image in enumerate(args.validation_images):
+        for image in args.validation_images:
             image = Image.open(image)
             image = pipeline(**pipeline_args, image=image, generator=generator).images[0]
-            torchvision.utils.save_image(image_save_transform(image), f"{args.output_dir}/{epoch}_{idx}.png")
             images.append(image)
 
     for tracker in accelerator.trackers:
@@ -307,7 +288,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=20,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -348,6 +329,12 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--learning_rate",
+        type=float,
+        default=5e-6,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--learning_rate_defense",
         type=float,
         default=5e-6,
         help="Initial learning rate (after the potential warmup period) to use.",
@@ -431,12 +418,6 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help="A prompt that is used during validation to verify that the model is learning.",
-    )
-    parser.add_argument(
-        "--validation_prompt_file",
-        type=str,
-        default=None,
-        help="A prompt file that contains prompts for validation.",
     )
     parser.add_argument(
         "--num_validation_images",
@@ -533,20 +514,13 @@ def parse_args(input_args=None):
         help="The optional `class_label` conditioning to pass to the unet, available values are `timesteps`.",
     )
     parser.add_argument(
-        "--imma_ckpt",
-        type=str,
-        default=None,
-        help=(
-            "The trained IMMA ckpt added to the loaded pretrained model"
-        ),
+        "--inner_loop_steps", type=int, default=1, help=("Number of training steps for inner loop before doing outer loop training")
     )
     parser.add_argument(
-        "--special_token",
-        type=str,
-        default=None,
-        help=(
-            "the new user defined token"
-        ),
+        "--outer_loop_steps", type=int, default=1, help=("Number of training steps for outer loop after doing inner loop training")
+    )
+    parser.add_argument(
+        "--max", type=int, default=None, help=("Directly maximizing model parameters as a vanilla way")
     )
     parser.add_argument(
         "--wandb_tmp",
@@ -556,6 +530,7 @@ def parse_args(input_args=None):
             "The trained defense ckpt added to the loaded pretrained model"
         ),
     )
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -790,7 +765,6 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-    
 
     if args.report_to == "wandb":
         if not is_wandb_available():
@@ -843,6 +817,7 @@ def main(args):
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
+                safety_checker=None,
             )
             pipeline.set_progress_bar_config(disable=True)
 
@@ -906,11 +881,22 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
-    if args.imma_ckpt is not None:
-        print("restroting from trained IMMA model weights")
-        model_dict = unet.state_dict()
-        model_dict.update(torch.load(args.imma_ckpt))
-        unet.load_state_dict(model_dict)
+    # get the parameters for defense
+    unet_attn_params = []
+    unet_attn_names = []
+    xattn_layer_names = ['to_q', 'to_v', 'to_k', 'to_out']
+    for name, param in unet.named_parameters():
+        if any([key in name for key in xattn_layer_names]) and 'lora' not in name:
+            unet_attn_names.append(name)
+            unet_attn_params.append(param)
+    
+    def freeze_grad(params):
+        for param in params:
+            param.requires_grad_(False)
+    
+    def free_grad(params):
+        for param in params:
+            param.requires_grad_(True)
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -1017,6 +1003,14 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    optimizer_defense = optimizer_class(
+        unet_attn_params,
+        lr=args.learning_rate_defense,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
     if args.pre_compute_text_embeddings:
 
         def compute_text_embeddings(prompt):
@@ -1034,11 +1028,8 @@ def main(args):
         pre_computed_encoder_hidden_states = compute_text_embeddings(args.instance_prompt)
         validation_prompt_negative_prompt_embeds = compute_text_embeddings("")
 
-        if args.validation_prompt_file is not None:
-            validation_prompts_df = pd.read_csv(args.validation_prompt_file)
-            validation_prompt_encoder_hidden_states = [compute_text_embeddings(str(row.prompt)) for _, row in validation_prompts_df.iterrows()]*args.num_validation_images
-        elif args.validation_prompt is not None:
-            validation_prompt_encoder_hidden_states = [compute_text_embeddings(args.validation_prompt)]
+        if args.validation_prompt is not None:
+            validation_prompt_encoder_hidden_states = compute_text_embeddings(args.validation_prompt)
         else:
             validation_prompt_encoder_hidden_states = None
 
@@ -1097,14 +1088,23 @@ def main(args):
         power=args.lr_power,
     )
 
+    lr_scheduler_defense = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer_defense,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
     # Prepare everything with our `accelerator`.
     if args.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        unet, text_encoder, optimizer, train_dataloader, lr_scheduler, optimizer_defense, lr_scheduler_defense = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler, optimizer_defense, lr_scheduler_defense
         )
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        unet, optimizer, train_dataloader, lr_scheduler, optimizer_defense, lr_scheduler_defense = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler, optimizer_defense, lr_scheduler_defense
         )
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -1132,7 +1132,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth", config=vars(args))
+        accelerator.init_trackers("dreambooth_defense", config=vars(args))
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1190,6 +1190,16 @@ def main(args):
 
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+
+                if args.max:
+                    unet.requires_grad_(False)
+                    free_grad(unet_attn_params)
+                else:
+                    if (step + epoch * len(train_dataloader)) % (args.inner_loop_steps + args.outer_loop_steps) < args.inner_loop_steps:
+                        unet.requires_grad_(True)
+                    else:
+                        unet.requires_grad_(False)
+                        free_grad(unet_attn_params)
 
                 if vae is not None:
                     # Convert images to latent space
@@ -1263,68 +1273,66 @@ def main(args):
                     prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
-                    # TODO add the gradient loss using torch.gradient
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                
-                # Define trainable parameters based on the condition
-                if args.train_text_encoder:
-                    trainable_params = list(unet.parameters()) + list(text_encoder.parameters())
-                else:
-                    trainable_params = list(unet.parameters())
 
-                # trainable_params = [p for p in unet.parameters() if p.requires_grad]
-                # gradient_loss = (torch.autograd.grad(loss, params_to_optimize, create_graph=True)[0])
-                # gradient_loss = (torch.autograd.grad(loss, trainable_params, create_graph=True)[0])
-                gradient_loss = (torch.autograd.grad(loss, model_pred.float(), create_graph=True)[0])
-                total_loss = (gradient_loss.mean()**2) - loss
+                # gradient_loss = (torch.autograd.grad(loss, model_pred.float(), create_graph=True)[0])
+                gradient_loss = (torch.autograd.grad(loss, unet_attn_params, create_graph=True)[0])
+                total_loss = (gradient_loss.mean()**2) - (0.2*loss)
                 loss = total_loss
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                    accelerator.clip_grad_norm_(unet_attn_params, args.max_grad_norm)
+                optimizer_defense.step()
+                lr_scheduler_defense.step()
+                optimizer_defense.zero_grad(set_to_none=args.set_grads_to_none)
 
+                # if args.max:
+                    # accelerator.backward(-loss)
+                    # if accelerator.sync_gradients:
+                    #     accelerator.clip_grad_norm_(unet_attn_params, args.max_grad_norm)
+                    # optimizer_defense.step()
+                    # lr_scheduler_defense.step()
+                    # optimizer_defense.zero_grad(set_to_none=args.set_grads_to_none)
+                # else:
+                #     if (step + epoch * len(train_dataloader)) % (args.inner_loop_steps + args.outer_loop_steps) < args.inner_loop_steps:
+                #         accelerator.backward(loss)
+                #         if accelerator.sync_gradients:
+                #             params_to_clip = (
+                #                 itertools.chain(unet.parameters(), text_encoder.parameters())
+                #                 if args.train_text_encoder
+                #                 else unet.parameters()
+                #             )
+                #             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                #         optimizer.step()
+                #         lr_scheduler.step()
+                #         optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                #     else:
+                #         accelerator.backward(-loss)
+                #         if accelerator.sync_gradients:
+                #             accelerator.clip_grad_norm_(unet_attn_params, args.max_grad_norm)
+                #         optimizer_defense.step()
+                #         lr_scheduler_defense.step()
+                #         optimizer_defense.zero_grad(set_to_none=args.set_grads_to_none)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                    
 
-                # if accelerator.is_main_process:
-                #     images = []
-
-                #     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                #         images = log_validation(
-                #             text_encoder,
-                #             tokenizer,
-                #             unet,
-                #             vae,
-                #             args,
-                #             accelerator,
-                #             weight_dtype,
-                #             epoch,
-                #             validation_prompt_encoder_hidden_states,
-                #             validation_prompt_negative_prompt_embeds,
-                #         )
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler_defense.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
-        
+
         images = []
 
-        if (args.validation_prompt is not None or args.validation_prompt_file is not None) and (epoch % args.validation_steps == 0):
+        if args.validation_prompt is not None and epoch % args.validation_steps == 0:
             images = log_validation(
                 text_encoder,
                 tokenizer,
@@ -1338,7 +1346,7 @@ def main(args):
                 validation_prompt_negative_prompt_embeds,
             )
 
-
+    torch.save({name: param for name, param in zip(unet_attn_names, unet_attn_params)}, f"{args.output_dir}/imma_unet_xatten_layer.pt")
 
     accelerator.end_training()
 
