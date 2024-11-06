@@ -1268,8 +1268,8 @@ def main(args):
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                gradient_loss = (torch.autograd.grad(loss, model_pred, create_graph=True)[0])
-                total_loss = (gradient_loss ** 2).mean() - loss
+                gradient_loss = (torch.autograd.grad(loss, params_to_optimize, create_graph=True)[0])
+                total_loss = (gradient_loss.mean()**2) - loss
                 loss = total_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
