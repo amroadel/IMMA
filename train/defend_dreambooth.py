@@ -817,7 +817,6 @@ def main(args):
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
-                safety_checker=None,
             )
             pipeline.set_progress_bar_config(disable=True)
 
