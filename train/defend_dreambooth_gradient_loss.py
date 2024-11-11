@@ -817,7 +817,6 @@ def main(args):
                 torch_dtype=torch_dtype,
                 safety_checker=None,
                 revision=args.revision,
-                safety_checker=None,
             )
             pipeline.set_progress_bar_config(disable=True)
 
@@ -1278,8 +1277,9 @@ def main(args):
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 # gradient_loss = (torch.autograd.grad(loss, model_pred.float(), create_graph=True)[0])
-                gradient_loss = (torch.autograd.grad(loss, unet_attn_params, create_graph=True)[0])
-                total_loss = (gradient_loss.mean()**2) - (0.2*loss)
+                gradients = torch.autograd.grad(loss, unet_attn_params, create_graph=True)
+                gradient_loss = sum(g.pow(2).sum() for g in gradients)
+                total_loss = gradient_loss - (0.2*loss)
                 loss = total_loss
 
                 accelerator.backward(loss)
@@ -1322,8 +1322,8 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
                     
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler_defense.get_last_lr()[0]}
+            # TODO print the gradient loss and the typical loss
+            logs = {"gradient_loss": gradient_loss,"loss": loss.detach().item(), "lr": lr_scheduler_defense.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
