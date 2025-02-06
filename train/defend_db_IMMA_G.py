@@ -1276,8 +1276,11 @@ def main(args):
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                gradients = torch.autograd.grad(loss, unet_attn_params, create_graph=True)
-                gradient_loss = sum(g.pow(2).sum() for g in gradients)
+                gradients = torch.autograd.grad(loss, unet_attn_params, create_graph=True, retain_graph=True)
+                grad_vector = torch.cat([g.contiguous().view(-1) for g in gradients])
+                gradient_loss = torch.norm(grad_vector, p=2) ** 2
+
+                # gradient_loss = sum(g.pow(2).sum() for g in gradients)
 
                 if args.max:
                     accelerator.backward(-loss)
@@ -1300,8 +1303,8 @@ def main(args):
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=args.set_grads_to_none)
                     else:
-                        loss = loss - gradient_loss
-                        accelerator.backward(-loss)
+                        # loss = loss - gradient_loss
+                        accelerator.backward(gradient_loss)
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(unet_attn_params, args.max_grad_norm)
                         optimizer_defense.step()
